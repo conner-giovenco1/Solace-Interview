@@ -1,0 +1,249 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Step Functions orchestration + Glue jobs + Crawler + Athena + QuickSight setup
+
+Parameters:
+  GlueVizJobName:
+    Type: String
+    Description: Name of the Glue visualization job
+  GlueMLJobName:
+    Type: String
+    Description: Name of the Glue ML job
+  S3ProcessedBucket:
+    Type: String
+    Description: S3 bucket for processed Parquet output and Athena results
+  QuickSightPrincipalArn:
+    Type: String
+    Description: IAM ARN of the QuickSight principal (user or service role)
+
+Resources:
+
+  ####################
+  # IAM Roles
+  ####################
+
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: GlueServiceRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub "arn:aws:s3:::${S3ProcessedBucket}"
+                  - !Sub "arn:aws:s3:::${S3ProcessedBucket}/*"
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: NightlyWorkflowRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GlueInvocationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                Resource: '*'
+
+  ####################
+  # Glue Infrastructure
+  ####################
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: user_events_db
+        Description: Database for processed user events
+
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: user-events-crawler
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${S3ProcessedBucket}/processed-events/"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  ####################
+  # Athena Setup
+  ####################
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: user-events-wg
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${S3ProcessedBucket}/athena-results/"
+
+  AthenaNamedQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: SelectAllUserEvents
+      Database: !Ref GlueDatabase
+      QueryString: !Sub |
+        SELECT * FROM user_events_db.user_events_table LIMIT 100;
+      Description: Sample query on user events
+      WorkGroup: !Ref AthenaWorkGroup
+
+  ####################
+  # QuickSight Setup
+  ####################
+  QuickSightDataSource:
+    Type: AWS::QuickSight::DataSource
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSourceId: userEventsAthenaSource
+      Name: UserEventsAthenaSource
+      Type: ATHENA
+      DataSourceParameters:
+        AthenaParameters:
+          WorkGroup: !Ref AthenaWorkGroup
+
+  QuickSightDataSet:
+    Type: AWS::QuickSight::DataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: userEventsDataSet
+      Name: UserEventsDataSet
+      PhysicalTableMap:
+        EventsTable:
+          RelationalTable:
+            DataSourceArn: !GetAtt QuickSightDataSource.Arn
+            Catalog: !Ref AWS::AccountId
+            Database: !Ref GlueDatabase
+            Name: user_events_table
+      ImportMode: SPICE
+
+  QuickSightDashboard:
+    Type: AWS::QuickSight::Dashboard
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DashboardId: userEventsDashboard
+      Name: User Events Overview
+      SourceEntity:
+        SourceTemplate:
+          DataSetReferences:
+            - DataSetPlaceholder: EventsData
+              DataSetArn: !GetAtt QuickSightDataSet.Arn
+          Arn: !Sub |
+            arn:aws:quicksight:${AWS::Region}:${AWS::AccountId}:template/your-template-id
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - quicksight:DescribeDashboard
+            - quicksight:ListDashboardVersions
+            - quicksight:QueryDashboard
+
+  ####################
+  # Glue Jobs
+  ####################
+  GlueVizJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Ref GlueVizJobName
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${S3ProcessedBucket}/scripts/viz_job.py"
+
+  GlueMLJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Ref GlueMLJobName
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${S3ProcessedBucket}/scripts/ml_job.py"
+
+  ####################
+  # Step Functions State Machine
+  ####################
+  NightlyWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: NightlyWorkflow
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Orchestrate viz & ML nightly workflows",
+          "StartAt": "ParallelBranches",
+          "States": {
+            "ParallelBranches": {
+              "Type": "Parallel",
+              "Branches": [
+                {
+                  "StartAt": "Visualization",
+                  "States": {
+                    "Visualization": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+                      "Parameters": {
+                        "JobName": "${GlueVizJobName}"
+                      },
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "MLProcessing",
+                  "States": {
+                    "MLProcessing": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+                      "Parameters": {
+                        "JobName": "${GlueMLJobName}"
+                      },
+                      "End": true
+                    }
+                  }
+                }
+              ],
+              "End": true
+            }
+          }
+        }
+
+Outputs:
+  GlueDatabaseName:
+    Description: Name of the Glue database
+    Value: !Ref GlueDatabase
+  GlueCrawlerName:
+    Description: Name of the Glue crawler
+    Value: !Ref GlueCrawler
+  AthenaWorkGroupName:
+    Description: Name of the Athena workgroup
+    Value: !Ref AthenaWorkGroup
+  QuickSightDashboardArn:
+    Description: ARN of the QuickSight dashboard
+    Value: !Sub "arn:aws:quicksight:${AWS::Region}:${AWS::AccountId}:dashboard/userEventsDashboard"

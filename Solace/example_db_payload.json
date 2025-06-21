@@ -1,0 +1,13 @@
+{
+  "userId": "u123",
+  "timestamp": "2025-06-21T12:34:56Z",
+  "location": {
+    "city": "Chicago",
+    "state": "IL"
+  },
+  "itemsPurchased": [
+    {"itemId": "A1", "price": 100},
+    {"itemId": "B2", "price": 50}
+  ],
+  "timesPurchased": 3
+}
