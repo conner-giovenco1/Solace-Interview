@@ -1,5 +1,6 @@
-Hi Solace team, 
+Hi Solace team,
 
-Just wanted included some example python and terraform code that would be the basis of this project. The code is under the Solace folder, along with an example of the dynamoDB payload that I would hypothetically save.
+I’ve added sample Python and Terraform code in the Solace folder to serve as the foundation for this project, along with a mock DynamoDB payload for your reference.
 
-Thanks, Conner
+Thanks,
+Conner
